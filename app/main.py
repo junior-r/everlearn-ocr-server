@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, s
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from .engine import OcrEngine, TesseractEngine, UnreadableImageError
+from .engine import OcrEngine, RapidOcrEngine, UnreadableImageError
 from .service import extract_identity
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -22,7 +22,6 @@ logger = logging.getLogger("ocr-server")
 class Settings:
     def __init__(self) -> None:
         self.internal_secret = os.environ.get("INTERNAL_SERVICE_SECRET", "")
-        self.languages = os.environ.get("OCR_LANGUAGES", "spa+eng")
         # OCR is CPU-bound: more simultaneous reads than cores only makes each one slower
         self.max_concurrency = int(os.environ.get("OCR_MAX_CONCURRENCY", os.cpu_count() or 2))
 
@@ -39,7 +38,7 @@ class ExtractionResponse(BaseModel):
 
 def create_app(engine: OcrEngine | None = None, settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
-    engine = engine or TesseractEngine(settings.languages)
+    engine = engine or RapidOcrEngine()
     limiter = asyncio.Semaphore(settings.max_concurrency)
     app = FastAPI(title="Everlearn OCR", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -77,7 +76,7 @@ def create_app(engine: OcrEngine | None = None, settings: Settings | None = None
             document_number=fields.document_number,
             birth_date=fields.birth_date.isoformat() if fields.birth_date else None,
             confidence=result.confidence,
-            engine="tesseract",
+            engine="rapidocr",
         )
 
     return app

@@ -12,7 +12,7 @@ from datetime import date
 
 _WEIGHTS = (7, 3, 1)
 _MRZ_LINE = re.compile(r"^[A-Z0-9<]{28,46}$")
-# Tesseract often reads the filler "<" as these characters
+# OCR engines often read the filler "<" as these characters
 _FILLER_LOOKALIKES = str.maketrans({"«": "<", "‹": "<", "(": "<", "{": "<", "[": "<"})
 
 
