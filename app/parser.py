@@ -1,17 +1,19 @@
-"""Turns the text read from an identity document into structured fields.
+"""Turns the text boxes read from an identity document into structured fields.
 
-Pure functions only: no OCR and no I/O, so every rule here is unit-tested with
-plain strings. Rules are written for Spanish-language IDs (cédula, DNI) and for
-passports, and fall back to patterns when a document has no recognisable labels.
+Pure functions only: no OCR and no I/O, so every rule is unit-tested with hand-placed boxes.
+A value is found where it is printed: inside its label's box, or the nearest box that follows
+the label (to its right, then below), or the one above it when nothing valid follows.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 
+from .layout import Direction, TextBox, neighbours, rows
 from .mrz import parse_mrz
 
 _MONTHS = {
@@ -22,28 +24,41 @@ _MONTHS = {
 _NUMERIC_DATE = re.compile(r"\b(\d{1,2})\s*[/.\-]\s*(\d{1,2})\s*[/.\-]\s*(\d{4})\b")
 _ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _TEXT_DATE = re.compile(r"\b(\d{1,2})[\s/.\-]+([A-Z]{3})[A-Z]*[\s/.\-]+(\d{4})\b")
-
-# "V-12.345.678", "V 12345678", "E-84.123.456": a nationality letter and a grouped number
-_PREFIXED_NUMBER = re.compile(r"\b([VEJGP])\s*[-.]?\s*(\d{1,3}(?:[.,\s]?\d{3}){1,3})\b")
-_GROUPED_NUMBER = re.compile(r"\b(\d{1,3}(?:[.,]\d{3}){1,3})\b")
-_PLAIN_NUMBER = re.compile(r"\b(\d{6,10}[A-Z]?)\b")
-# Passport numbers mix letters and digits ("L898902C3"); only trusted right after a label
-_ALPHANUMERIC_NUMBER = re.compile(r"\b((?=[A-Z0-9]*\d[A-Z0-9]*\d[A-Z0-9]*\d)[A-Z0-9]{6,12})\b")
-
-_SURNAME_LABEL = re.compile(r"\b(?:PRIMER\s+|SEGUNDO\s+)?(?:APELLIDOS?|SURNAMES?|LAST\s+NAMES?)\b")
-_GIVEN_LABEL = re.compile(r"\b(?:GIVEN\s+NAMES?|FIRST\s+NAMES?|PRENOMBRES?|NOMBRES?)\b")
-_NUMBER_LABEL = re.compile(
-    r"\b(?:CEDULA|C\.?\s?I\.?|DNI|NIE|DOCUMENTO|IDENTIDAD|PASAPORTE|PASSPORT|NUMERO|NUM|NRO|NO)\b"
-)
-_BIRTH_LABEL = re.compile(r"\b(?:NACIMIENTO|NAC|BIRTH|DOB|NACIDO|NACIDA)\b")
-_ANY_LABEL = re.compile(
-    r"\b(?:APELLIDOS?|NOMBRES?|SURNAMES?|NAMES?|NACIMIENTO|NAC|BIRTH|CEDULA|DNI|DOCUMENTO|"
-    r"IDENTIDAD|PASAPORTE|PASSPORT|NACIONALIDAD|NATIONALITY|SEXO|SEX|EXPEDICION|VENCIMIENTO|"
-    r"EMISION|EXPIRY|FIRMA|ESTADO|REPUBLICA)\b"
-)
-_NAME_VALUE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ' \-]{1,60}$", re.IGNORECASE)
-
 _MIN_BIRTH_YEAR = 1900
+
+
+def _label(alternatives: str) -> re.Pattern[str]:
+    """A label at the start of a box; a letter right after it means a longer, different word."""
+    return re.compile(rf"^(?:{alternatives})(?![A-Z])")
+
+
+_SURNAME = r"(?:PRIMER\s+|SEGUNDO\s+)?APELLIDOS?|SURNAMES?|LAST\s+NAMES?"
+_GIVEN = r"NOMBRES?|PRENOMBRES?|GIVEN\s+NAMES?|FIRST\s+NAMES?"
+_BIRTH = r"(?:F\.?|FECHA\s+DE)\s*NACIMIENTO|NACIMIENTO|FECHA\s+DE\s+NAC\.?|DATE\s+OF\s+BIRTH|BIRTH\s*DATE|DOB"
+_NUMBER = (
+    r"(?:DOCUMENTO|DOCUMENT|PASAPORTE|PASSPORT|CEDULA)\s+(?:N[O°º]|NRO|NUM(?:ERO)?)\.?"
+    r"|NUI|DNI|NIE|ID|C\.?\s?I\.?|N[O°º]\.?|NRO\.?|NUM(?:ERO)?\.?"
+)
+# Printed beside the identity fields; a box starting with one of these is never a value
+_OTHER = (
+    r"NACIONALIDAD|NATIONALITY|SEXO|SEX|LUGAR|FECHA|(?:F\.?\s*)?(?:EXPEDICION|VENCIMIENTO|EMISION)|"
+    r"(?:EDO\.?|ESTADO)\s*CIVIL|FIRMA|SIGNATURE|DOMICILIO|DIRECCION|EXPIRY|CONDICION|PROFESION|AUTOIDENTIFICACION"
+)
+
+_SURNAME_LABEL = _label(_SURNAME)
+_GIVEN_LABEL = _label(_GIVEN)
+_BIRTH_LABEL = _label(_BIRTH)
+_NUMBER_LABEL = _label(_NUMBER)
+_ANY_LABEL = _label("|".join((_SURNAME, _GIVEN, _BIRTH, _NUMBER, _OTHER)))
+# Bilingual cards print "APELLIDOS / SURNAMES": every label and separator before the value is skipped
+_LABEL_RUN = re.compile(rf"^(?:(?:{'|'.join((_SURNAME, _GIVEN, _BIRTH, _NUMBER))})(?![A-Z])[\s:/.|\-]*)+")
+
+_NAME_WORD = re.compile(r"[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ'\-]*", re.IGNORECASE)
+# Venezuelan style: a nationality letter and the number, usually grouped with dots ("V 12.345.678")
+_NATIONAL_ID = re.compile(r"\b([VE])\s*[-.]?\s*(\d{1,3}(?:\.\d{3}){1,2}|\d{6,9})\b")
+_LABELLED_NUMBER = re.compile(r"^(?:([VEJGP])\s*[-.]?\s*)?(\d[\d.,\s]{4,14}\d(?:-\d)?[A-Z]?)$")
+# Passport numbers mix letters and digits ("L898902C3"); only trusted right after a label
+_ALPHANUMERIC_NUMBER = re.compile(r"^(?=(?:[A-Z]*\d){3})[A-Z0-9]{6,12}$")
 
 
 @dataclass(frozen=True)
@@ -60,10 +75,14 @@ class ExtractedFields:
         ))  # fmt: skip
 
 
+def _fold_char(char: str) -> str:
+    base = "".join(part for part in unicodedata.normalize("NFD", char.upper()) if unicodedata.category(part) != "Mn")
+    return base if len(base) == 1 else char
+
+
 def fold(text: str) -> str:
-    """Upper-cases and strips accents, so labels match however the OCR read them."""
-    decomposed = unicodedata.normalize("NFD", text.upper())
-    return "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
+    """Upper-cases and strips accents one character at a time, so offsets still match the original text."""
+    return "".join(_fold_char(char) for char in unicodedata.normalize("NFC", text))
 
 
 def _make_date(year: int, month: int, day: int, today: date) -> date | None:
@@ -83,23 +102,17 @@ def find_dates(text: str, today: date) -> list[date]:
     for year, month, day in _ISO_DATE.findall(folded):
         found.append(_make_date(int(year), int(month), int(day), today))
     for day, month_name, year in _TEXT_DATE.findall(folded):
-        month = _MONTHS.get(month_name)
-        if month:
+        if month := _MONTHS.get(month_name):
             found.append(_make_date(int(year), month, int(day), today))
     return [parsed for parsed in found if parsed is not None]
 
 
-def _birth_date(lines: list[str], today: date) -> date | None:
-    for index, line in enumerate(lines):
-        if _BIRTH_LABEL.search(fold(line)):
-            # The value is on the label's line or, on two-row layouts, the next one
-            for candidate in (line, *lines[index + 1 : index + 2]):
-                dates = find_dates(candidate, today)
-                if dates:
-                    return dates[0]
-    # Without a label, the birth date is the earliest date: issue and expiry come later
-    every = find_dates("\n".join(lines), today)
-    return min(every) if every else None
+def _read_name(text: str) -> str | None:
+    """Every word must be written like a name; anything else means the box is not a name."""
+    words = [word.strip(".,;:") for word in text.split()]
+    if not words or not all(_NAME_WORD.fullmatch(word) for word in words) or len("".join(words)) < 2:
+        return None
+    return " ".join(words)
 
 
 def _normalize_number(prefix: str | None, digits: str) -> str:
@@ -107,84 +120,100 @@ def _normalize_number(prefix: str | None, digits: str) -> str:
     return f"{prefix}-{compact}" if prefix else compact
 
 
-def _number_in(text: str) -> str | None:
-    folded = fold(text)
-    if match := _PREFIXED_NUMBER.search(folded):
+def _read_labelled_number(text: str) -> str | None:
+    folded = fold(text).strip()
+    if match := _LABELLED_NUMBER.match(folded):
         return _normalize_number(match.group(1), match.group(2))
-    if match := _GROUPED_NUMBER.search(folded):
-        return _normalize_number(None, match.group(1))
-    if match := _PLAIN_NUMBER.search(folded):
-        return match.group(1)
+    return folded if _ALPHANUMERIC_NUMBER.match(folded) else None
+
+
+def _is_label(box: TextBox) -> bool:
+    return _ANY_LABEL.match(fold(box.text).strip()) is not None
+
+
+@dataclass(frozen=True)
+class _Found[T]:
+    value: T
+    box: TextBox
+    direction: Direction | None
+
+
+def _beside[T](label: TextBox, boxes: list[TextBox], read: Callable[[str], T | None]) -> _Found[T] | None:
+    """The nearest valid value following the label (right, then below), else the one above it."""
+    for direction in Direction:
+        for other in neighbours(label, boxes, direction):
+            if not _is_label(other) and (value := read(other.text)) is not None:
+                return _Found(value, other, direction)
     return None
 
 
-def _labelled_number_in(text: str) -> str | None:
-    """The number following a label, where an alphanumeric code is also acceptable."""
-    if number := _number_in(text):
-        return number
-    match = _ALPHANUMERIC_NUMBER.search(fold(text))
-    return match.group(1) if match else None
-
-
-def _document_number(lines: list[str]) -> str | None:
-    # Dates look like numbers, so they are removed before searching
-    without_dates = [
-        _TEXT_DATE.sub(" ", _ISO_DATE.sub(" ", _NUMERIC_DATE.sub(" ", fold(line)))) for line in lines
-    ]
-    for index, line in enumerate(without_dates):
-        if label := _NUMBER_LABEL.search(line):
-            # Only what follows the label on its line, so the label itself is never the value
-            for candidate in (line[label.end() :], *without_dates[index + 1 : index + 2]):
-                if number := _labelled_number_in(candidate):
-                    return number
-    # No label: prefer the most specific shape anywhere on the document
-    for pattern in (_PREFIXED_NUMBER, _GROUPED_NUMBER, _PLAIN_NUMBER):
-        for line in without_dates:
-            if match := pattern.search(line):
-                groups = match.groups()
-                prefix, digits = groups if len(groups) == 2 else (None, groups[0])
-                return _normalize_number(prefix, digits)
-    return None
-
-
-def _clean_name(value: str) -> str | None:
-    value = re.sub(r"[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ' \-]", " ", value)
-    value = " ".join(value.split())
-    if not _NAME_VALUE.match(value) or _ANY_LABEL.search(fold(value)):
-        return None
-    return value.title()
-
-
-def _labelled_name(lines: list[str], label: re.Pattern[str]) -> str | None:
-    for index, line in enumerate(lines):
-        match = label.search(fold(line))
-        if not match:
+def _labelled[T](boxes: list[TextBox], label: re.Pattern[str], read: Callable[[str], T | None]) -> _Found[T] | None:
+    """The first value printed with the label: inside the label's own box, or beside it."""
+    for box in boxes:
+        text = unicodedata.normalize("NFC", box.text).strip()
+        folded = fold(text)
+        if not label.match(folded):
             continue
-        # Same line, after the label and any separator ("NOMBRES: MARIA")
-        same_line = _clean_name(line[match.end() :].lstrip(" :.-"))
-        if same_line:
-            return same_line
-        if index + 1 < len(lines) and (next_line := _clean_name(lines[index + 1])):
-            return next_line
+        labels = _LABEL_RUN.match(folded)
+        rest = text[labels.end() :] if labels else ""
+        if rest and (value := read(rest)) is not None:
+            return _Found(value, box, None)
+        if found := _beside(box, boxes, read):
+            return found
     return None
 
 
-def parse_document(text: str, today: date | None = None) -> ExtractedFields:
-    """Extracts the identity fields from OCR text. Any field it cannot find is None."""
+def _labelled_name(boxes: list[TextBox], label: re.Pattern[str]) -> str | None:
+    found = _labelled(boxes, label, _read_name)
+    if found is None:
+        return None
+    words = [found.value]
+    # A long name wraps onto the next line, or the engine splits it into several boxes along the line
+    continuation = Direction.RIGHT if found.direction in (None, Direction.RIGHT) else found.direction
+    current = found.box
+    while (
+        (following := next(neighbours(current, boxes, continuation), None))
+        and not _is_label(following)
+        and (more := _read_name(following.text))
+    ):
+        words.append(more)
+        current = following
+    return " ".join(words).title()
+
+
+def _document_number(boxes: list[TextBox]) -> str | None:
+    if found := _labelled(boxes, _NUMBER_LABEL, _read_labelled_number):
+        return found.value
+    for line in rows(boxes):
+        if match := _NATIONAL_ID.search(fold(" ".join(box.text for box in line))):
+            return _normalize_number(match.group(1), match.group(2))
+    return None
+
+
+def _birth_date(boxes: list[TextBox], today: date) -> date | None:
+    def read(text: str) -> date | None:
+        return next(iter(find_dates(text, today)), None)
+
+    found = _labelled(boxes, _BIRTH_LABEL, read)
+    return found.value if found else None
+
+
+def parse_document(boxes: list[TextBox], today: date | None = None) -> ExtractedFields:
+    """Extracts the identity fields from the boxes of one read. Any field it cannot find is None."""
     today = today or date.today()
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
+    boxes = [box for box in boxes if box.text.strip()]
+    if not boxes:
         return ExtractedFields()
 
     # The machine-readable zone is parsed on its own; as plain text its digits would look like numbers and dates
-    printed = [line for line in lines if "<<" not in line]
+    printed = [box for box in boxes if "<<" not in box.text]
     labelled = ExtractedFields(
         first_name=_labelled_name(printed, _GIVEN_LABEL),
         last_name=_labelled_name(printed, _SURNAME_LABEL),
         document_number=_document_number(printed),
         birth_date=_birth_date(printed, today),
     )
-    mrz = parse_mrz(lines, today)
+    mrz = parse_mrz(["".join(box.text for box in line) for line in rows(boxes)], today)
     if mrz is None:
         return labelled
     # A verified MRZ beats anything read from the printed labels; an unverified

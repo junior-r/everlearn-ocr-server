@@ -1,5 +1,6 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
-pytesseract>=0.3.10
 pillow>=10.4
+rapidocr>=3.10,<4
+onnxruntime>=1.20

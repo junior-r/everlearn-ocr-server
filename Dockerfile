@@ -1,17 +1,14 @@
 FROM python:3.13-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    # One thread per Tesseract process: concurrency comes from handling several requests at once
-    OMP_THREAD_LIMIT=1
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-spa tesseract-ocr-eng \
-    && rm -rf /var/lib/apt/lists/*
+    PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Creating the engine once downloads its models into the image, so the service never needs the internet
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -c "from rapidocr import RapidOCR; RapidOCR()"
 COPY app ./app
 
-# Build with `--target test` to run the suite, including the tests that need Tesseract
+# Build with `--target test` to run the suite, including the tests that run the real models
 FROM base AS test
 RUN apt-get update \
     && apt-get install -y --no-install-recommends fonts-dejavu-core \

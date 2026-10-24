@@ -1,82 +1,56 @@
-"""Reading text from an image: preprocessing plus the Tesseract call."""
+"""Reading text from an image: decoding plus the RapidOCR call."""
 
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
 from typing import Protocol
 
-import pytesseract
 from PIL import Image, ImageOps, UnidentifiedImageError
+from rapidocr import RapidOCR
+
+from .layout import TextBox
 
 # Refuse absurdly large images instead of decompressing them into memory
 Image.MAX_IMAGE_PIXELS = 40_000_000
-
-_TARGET_WIDTH = 1800
-_MAX_UPSCALE = 3.0
-_MIN_SIDE = 64
 
 
 class UnreadableImageError(ValueError):
     """The bytes are not an image Pillow can decode."""
 
 
-@dataclass(frozen=True)
-class OcrText:
-    text: str
-    # Mean confidence Tesseract reported for the words it read, from 0 to 1
-    confidence: float
-
-
 class OcrEngine(Protocol):
-    def read(self, image_bytes: bytes, page_segmentation_mode: int) -> OcrText: ...
+    def read(self, image_bytes: bytes) -> list[TextBox]: ...
 
 
-def prepare_image(image_bytes: bytes) -> Image.Image:
-    """Decodes and normalises a photo for OCR: upright, greyscale, large enough, high contrast."""
+def decode_image(image_bytes: bytes) -> Image.Image:
+    """Decodes a photo and turns it upright."""
     try:
         image = Image.open(io.BytesIO(image_bytes))
         image.load()
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as error:
         raise UnreadableImageError(str(error)) from error
     # Phone cameras store rotation as metadata rather than rotating the pixels
-    image = ImageOps.exif_transpose(image).convert("L")
-    # Tesseract is most accurate when capital letters are roughly 30 px tall
-    scale = min(_MAX_UPSCALE, _TARGET_WIDTH / image.width)
-    if scale > 1.05:
-        size = (round(image.width * scale), round(image.height * scale))
-        image = image.resize(size, Image.Resampling.LANCZOS)
-    return ImageOps.autocontrast(image, cutoff=1)
+    return ImageOps.exif_transpose(image).convert("RGB")
 
 
-class TesseractEngine:
-    def __init__(self, languages: str) -> None:
-        self._languages = languages
+class RapidOcrEngine:
+    """PaddleOCR's detection and recognition models, run on the CPU with ONNX Runtime."""
 
-    def read(self, image_bytes: bytes, page_segmentation_mode: int) -> OcrText:
-        image = prepare_image(image_bytes)
-        # Too small to hold legible text, and Tesseract errors out on such images
-        if min(image.size) < _MIN_SIDE:
-            return OcrText(text="", confidence=0.0)
-        try:
-            data = pytesseract.image_to_data(
-                image,
-                lang=self._languages,
-                config=f"--psm {page_segmentation_mode}",
-                output_type=pytesseract.Output.DICT,
+    def __init__(self) -> None:
+        self._ocr = RapidOCR(params={"Global.log_level": "error"})
+
+    def read(self, image_bytes: bytes) -> list[TextBox]:
+        result = self._ocr(decode_image(image_bytes))
+        if result.boxes is None or result.txts is None or result.scores is None:
+            return []
+        return [
+            TextBox(
+                text=text,
+                left=float(min(x for x, _ in polygon)),
+                top=float(min(y for _, y in polygon)),
+                right=float(max(x for x, _ in polygon)),
+                bottom=float(max(y for _, y in polygon)),
+                score=float(score),
             )
-        except pytesseract.TesseractError:
-            # A valid image Tesseract cannot process is "nothing readable", not a server fault
-            return OcrText(text="", confidence=0.0)
-        lines: dict[tuple[int, int, int], list[str]] = {}
-        confidences: list[float] = []
-        for index, word in enumerate(data["text"]):
-            confidence = float(data["conf"][index])
-            if not word.strip() or confidence < 0:
-                continue
-            key = (data["block_num"][index], data["par_num"][index], data["line_num"][index])
-            lines.setdefault(key, []).append(word)
-            confidences.append(confidence)
-        text = "\n".join(" ".join(words) for words in lines.values())
-        mean = sum(confidences) / len(confidences) / 100 if confidences else 0.0
-        return OcrText(text=text, confidence=mean)
+            for polygon, text, score in zip(result.boxes, result.txts, result.scores, strict=True)
+        ]
